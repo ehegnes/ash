@@ -8,7 +8,6 @@ extern crate cocoa;
 extern crate metal_rs as metal;
 #[cfg(target_os = "macos")]
 extern crate objc;
-extern crate winit;
 #[cfg(target_os = "macos")]
 use cocoa::appkit::{NSView, NSWindow};
 #[cfg(target_os = "macos")]
@@ -21,10 +20,9 @@ use objc::runtime::YES;
 use std::mem;
 
 #[cfg(all(unix, not(target_os = "android"), not(target_os = "macos")))]
-use ash::extensions::khr::XlibSurface;
 use ash::extensions::{
     ext::DebugReport,
-    khr::{Surface, Swapchain},
+    khr::{Display, Surface, Swapchain, XlibSurface},
 };
 
 #[cfg(target_os = "windows")]
@@ -118,6 +116,71 @@ unsafe fn create_surface<E: EntryV1_0, I: InstanceV1_0>(
     xlib_surface_loader.create_xlib_surface(&x11_create_info, None)
 }
 
+#[cfg(all(unix, not(target_os = "android"), not(target_os = "macos")))]
+unsafe fn create_surface_display<E: EntryV1_0, I: InstanceV1_0>(
+    entry: &E,
+    instance: &I,
+    physical_device: vk::PhysicalDevice,
+) -> Result<vk::SurfaceKHR, vk::Result> {
+    let display_loader = Display::new(entry, instance);
+
+    let display_props =
+        display_loader.get_physical_device_display_properties(physical_device)
+            .expect("could not get device display props")[0];
+    println!("display_props: {:#?}", display_props);
+
+    let display = display_props.display;
+
+    let mode_props = display_loader.get_display_mode_properties(physical_device, display)
+            .expect("could not get display mode props")[0];
+    println!("mode_props: {:#?}", mode_props);
+
+    // XXX: getting 0x0 for display?
+    let plane_props = display_loader.get_physical_device_display_plane_properties(physical_device)
+            .expect("could not get display plane props");
+    println!("plane_props: {:#?}", plane_props);
+
+    let plane_index = 0;
+
+    // Get plane capabilities
+    let plane_caps = display_loader.get_display_plane_capabilities(physical_device, mode_props.display_mode, plane_index)
+            .expect("could not get display plane capabilities");
+    println!("plane_caps:\n{:#?}", plane_caps);
+
+    let mut alpha_mode = vk::DisplayPlaneAlphaFlagsKHR::OPAQUE;
+    let alpha_modes = [
+        vk::DisplayPlaneAlphaFlagsKHR::OPAQUE,
+        vk::DisplayPlaneAlphaFlagsKHR::GLOBAL,
+        vk::DisplayPlaneAlphaFlagsKHR::PER_PIXEL,
+        vk::DisplayPlaneAlphaFlagsKHR::PER_PIXEL_PREMULTIPLIED,
+    ];
+    for &a_mode in alpha_modes.iter() {
+        if a_mode.contains(plane_caps.supported_alpha) {
+            alpha_mode = a_mode;
+        }
+    }
+    println!("alpha_mode:\n{:#?}", alpha_mode);
+
+    let image_extent = vk::Extent2D::builder()
+        .width(mode_props.parameters.visible_region.width)
+        .height(mode_props.parameters.visible_region.height);
+
+    let create_info = vk::DisplaySurfaceCreateInfoKHR::builder()
+        .display_mode(mode_props.display_mode)
+        .plane_index(plane_index)
+        .plane_stack_index(plane_props[plane_index as usize].current_stack_index)
+        .transform(vk::SurfaceTransformFlagsKHR::IDENTITY)
+        .alpha_mode(alpha_mode)
+        .global_alpha(1f32)
+        .image_extent(image_extent.build());
+
+    let surface = display_loader.create_display_plane_surface(&create_info, None)
+            .expect("could not create display plane surface");
+    println!("surface:\n{:#?}", surface);
+
+    display_loader.create_display_plane_surface(&create_info, None)
+}
+
 #[cfg(target_os = "macos")]
 unsafe fn create_surface<E: EntryV1_0, I: InstanceV1_0>(
     entry: &E,
@@ -179,6 +242,7 @@ unsafe fn create_surface<E: EntryV1_0, I: InstanceV1_0>(
 #[cfg(all(unix, not(target_os = "android"), not(target_os = "macos")))]
 fn extension_names() -> Vec<*const i8> {
     vec![
+        Display::name().as_ptr(),
         Surface::name().as_ptr(),
         XlibSurface::name().as_ptr(),
         DebugReport::name().as_ptr(),
@@ -259,8 +323,6 @@ pub struct ExampleBase {
     pub surface_loader: Surface,
     pub swapchain_loader: Swapchain,
     pub debug_report_loader: DebugReport,
-    pub window: winit::Window,
-    pub events_loop: RefCell<winit::EventsLoop>,
     pub debug_call_back: vk::DebugReportCallbackEXT,
 
     pub pdevice: vk::PhysicalDevice,
@@ -290,41 +352,15 @@ pub struct ExampleBase {
 
 impl ExampleBase {
     pub fn render_loop<F: Fn()>(&self, f: F) {
-        use winit::*;
-        self.events_loop.borrow_mut().run_forever(|event| {
-            f();
-            match event {
-                Event::WindowEvent { event, .. } => match event {
-                    WindowEvent::KeyboardInput { input, .. } => {
-                        if let Some(VirtualKeyCode::Escape) = input.virtual_keycode {
-                            ControlFlow::Break
-                        } else {
-                            ControlFlow::Continue
-                        }
-                    }
-                    WindowEvent::CloseRequested => winit::ControlFlow::Break,
-                    _ => ControlFlow::Continue,
-                },
-                _ => ControlFlow::Continue,
-            }
-        });
+        f();
     }
 
-    pub fn new(window_width: u32, window_height: u32) -> Self {
+    pub fn new() -> Self {
         unsafe {
-            let events_loop = winit::EventsLoop::new();
-            let window = winit::WindowBuilder::new()
-                .with_title("Ash - Example")
-                .with_dimensions(winit::dpi::LogicalSize::new(
-                    f64::from(window_width),
-                    f64::from(window_height),
-                ))
-                .build(&events_loop)
-                .unwrap();
             let entry = Entry::new().unwrap();
             let app_name = CString::new("VulkanTriangle").unwrap();
 
-            let layer_names = [CString::new("VK_LAYER_LUNARG_standard_validation").unwrap()];
+            let layer_names = [CString::new("VK_LAYER_KHRONOS_validation").unwrap()];
             let layers_names_raw: Vec<*const i8> = layer_names
                 .iter()
                 .map(|raw_name| raw_name.as_ptr())
@@ -360,11 +396,11 @@ impl ExampleBase {
             let debug_call_back = debug_report_loader
                 .create_debug_report_callback(&debug_info, None)
                 .unwrap();
-            let surface = create_surface(&entry, &instance, &window).unwrap();
             let pdevices = instance
                 .enumerate_physical_devices()
                 .expect("Physical device error");
             let surface_loader = Surface::new(&entry, &instance);
+            let surface = create_surface_display(&entry, &instance, pdevices[0]).unwrap();
             let (pdevice, queue_family_index) = pdevices
                 .iter()
                 .map(|pdevice| {
@@ -374,7 +410,7 @@ impl ExampleBase {
                         .enumerate()
                         .filter_map(|(index, ref info)| {
                             let supports_graphic_and_surface =
-                                info.queue_flags.contains(vk::QueueFlags::GRAPHICS)
+                                info.queue_flags.contains(vk::QueueFlags::GRAPHICS);
                                     && surface_loader
                                         .get_physical_device_surface_support(
                                             *pdevice,
@@ -393,6 +429,7 @@ impl ExampleBase {
                 .filter_map(|v| v)
                 .nth(0)
                 .expect("Couldn't find suitable device.");
+            let surface = create_surface_display(&entry, &instance, pdevice).unwrap();
             let queue_family_index = queue_family_index as u32;
             let device_extension_names_raw = [Swapchain::name().as_ptr()];
             let features = vk::PhysicalDeviceFeatures {
@@ -441,9 +478,10 @@ impl ExampleBase {
                 desired_image_count = surface_capabilities.max_image_count;
             }
             let surface_resolution = match surface_capabilities.current_extent.width {
+                // TODO: reuse from the display extent
                 std::u32::MAX => vk::Extent2D {
-                    width: window_width,
-                    height: window_height,
+                    width: 3840,
+                    height: 2160,
                 },
                 _ => surface_capabilities.current_extent,
             };
@@ -622,14 +660,12 @@ impl ExampleBase {
                 .create_semaphore(&semaphore_create_info, None)
                 .unwrap();
             ExampleBase {
-                events_loop: RefCell::new(events_loop),
                 entry,
                 instance,
                 device,
                 queue_family_index,
                 pdevice,
                 device_memory_properties,
-                window,
                 surface_loader,
                 surface_format,
                 present_queue,
